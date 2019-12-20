@@ -5725,7 +5725,7 @@ AfterTriggerSaveEvent(EState *estate, ResultRelInfo *relinfo,
 			new_shared.ats_table = NULL;
 		new_shared.ats_modifiedcols = modifiedCols;
 
-		if (new_shared.ats_table != NULL)
+		if (new_shared.ats_table != NULL && trigger->tgfoid == F_IVM_IMMEDIATE_MAINTENANCE)
 			new_shared.ats_table->prolonged = true;
 
 		afterTriggerAddEvent(&afterTriggers.query_stack[afterTriggers.query_depth].events,

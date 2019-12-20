@@ -32,24 +32,41 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_inherits.h"
+#include "catalog/pg_trigger.h"
+#include "catalog/pg_type.h"
 #include "catalog/toasting.h"
 #include "commands/createas.h"
+#include "commands/defrem.h"
 #include "commands/matview.h"
 #include "commands/prepare.h"
 #include "commands/tablecmds.h"
+#include "commands/trigger.h"
 #include "commands/view.h"
 #include "miscadmin.h"
+#include "optimizer/clauses.h"
+#include "optimizer/optimizer.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "parser/parser.h"
+#include "parser/parsetree.h"
 #include "parser/parse_clause.h"
+#include "parser/parse_func.h"
+#include "parser/parse_type.h"
 #include "rewrite/rewriteHandler.h"
+#include "rewrite/rewriteManip.h"
 #include "storage/smgr.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
+
+
+
 
 typedef struct
 {
@@ -73,6 +90,8 @@ static bool intorel_receive(TupleTableSlot *slot, DestReceiver *self);
 static void intorel_shutdown(DestReceiver *self);
 static void intorel_destroy(DestReceiver *self);
 
+static void CreateIvmTrigger(Oid relOid, Oid viewOid, int16 type, int16 timing);
+static void check_ivm_restriction_walker(Node *node);
 
 /*
  * create_ctas_internal
@@ -108,6 +127,8 @@ create_ctas_internal(List *attrList, IntoClause *into)
 	create->oncommit = into->onCommit;
 	create->tablespacename = into->tableSpaceName;
 	create->if_not_exists = false;
+	/* Using Materialized view only */
+	create->ivm = into->ivm;
 	create->accessMethod = into->accessMethod;
 
 	/*
@@ -294,6 +315,18 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 		save_nestlevel = NewGUCNestLevel();
 	}
 
+	if (is_matview && into->ivm)
+	{
+		if(contain_mutable_functions((Node *)query))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("mutable function is not supported on incrementally maintainable materialized view"),
+					 errhint("functions must be marked IMMUTABLE")));
+
+		check_ivm_restriction_walker((Node *) query);
+		query = rewriteQueryForIMMV(query, into->colNames);
+	}
+
 	if (into->skipData)
 	{
 		/*
@@ -318,6 +351,7 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 		 * and is executed repeatedly.  (See also the same hack in EXPLAIN and
 		 * PREPARE.)
 		 */
+
 		rewritten = QueryRewrite(copyObject(query));
 
 		/* SELECT should never rewrite to more or less than one SELECT query */
@@ -376,9 +410,122 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 
 		/* Restore userid and security context */
 		SetUserIdAndSecContext(save_userid, save_sec_context);
+
+
+		if (into->ivm)
+		{
+			Oid matviewOid = address.objectId;
+			Relation matviewRel = table_open(matviewOid, NoLock);
+			Relids	relids = NULL;
+
+			/*
+			 * Mark relisivm field, if it's a matview and into->ivm is true.
+			 */
+			SetMatViewIVMState(matviewRel, true);
+
+			if (!into->skipData)
+			{
+				CreateIvmTriggersOnBaseTables(query, (Node *)query->jointree, matviewOid, &relids);
+				bms_free(relids);
+			}
+			table_close(matviewRel, NoLock);
+		}
 	}
 
 	return address;
+}
+
+/*
+ * rewriteQueryForIMMV -- rewrite view definition query for IMMV
+ */
+Query *
+rewriteQueryForIMMV(Query *query, List *colNames)
+{
+	Query *rewritten;
+
+	TargetEntry *tle;
+	Node *node;
+	ParseState *pstate = make_parsestate(NULL);
+	FuncCall *fn;
+
+	rewritten = copyObject(query);
+	pstate->p_expr_kind = EXPR_KIND_SELECT_TARGET;
+
+	if (rewritten->distinctClause)
+		rewritten->groupClause = transformDistinctClause(NULL, &rewritten->targetList, rewritten->sortClause, false);
+
+	/* Add count(*) for counting algorithm */
+	if (rewritten->distinctClause)
+	{
+		fn = makeFuncCall(list_make1(makeString("count")), NIL, -1);
+		fn->agg_star = true;
+
+		node = ParseFuncOrColumn(pstate, fn->funcname, NIL, NULL, fn, false, -1);
+
+		tle = makeTargetEntry((Expr *) node,
+								list_length(rewritten->targetList) + 1,
+								pstrdup("__ivm_count__"),
+								false);
+		rewritten->targetList = lappend(rewritten->targetList, tle);
+		rewritten->hasAggs = true;
+	}
+
+
+	return rewritten;
+}
+
+/*
+ * CreateIvmTriggersOnBaseTables -- create IVM triggers on all base tables
+ */
+void
+CreateIvmTriggersOnBaseTables(Query *qry, Node *jtnode, Oid matviewOid, Relids *relids)
+{
+	if (jtnode == NULL)
+		return;
+	if (IsA(jtnode, RangeTblRef))
+	{
+		int			rti = ((RangeTblRef *) jtnode)->rtindex;
+		RangeTblEntry *rte = rt_fetch(rti, qry->rtable);
+
+		if (rte->rtekind == RTE_RELATION)
+		{
+			if (!bms_is_member(rte->relid, *relids))
+			{
+				CreateIvmTrigger(rte->relid, matviewOid, TRIGGER_TYPE_INSERT, TRIGGER_TYPE_BEFORE);
+				CreateIvmTrigger(rte->relid, matviewOid, TRIGGER_TYPE_DELETE, TRIGGER_TYPE_BEFORE);
+				CreateIvmTrigger(rte->relid, matviewOid, TRIGGER_TYPE_UPDATE, TRIGGER_TYPE_BEFORE);
+				CreateIvmTrigger(rte->relid, matviewOid, TRIGGER_TYPE_INSERT, TRIGGER_TYPE_AFTER);
+				CreateIvmTrigger(rte->relid, matviewOid, TRIGGER_TYPE_DELETE, TRIGGER_TYPE_AFTER);
+				CreateIvmTrigger(rte->relid, matviewOid, TRIGGER_TYPE_UPDATE, TRIGGER_TYPE_AFTER);
+
+				*relids = bms_add_member(*relids, rte->relid);
+			}
+		}
+		else if (rte->rtekind == RTE_SUBQUERY)
+		{
+			Query *subquery = rte->subquery;
+			Assert(rte->subquery != NULL);
+
+			CreateIvmTriggersOnBaseTables(subquery, (Node *)subquery->jointree, matviewOid, relids);
+		}
+	}
+	else if (IsA(jtnode, FromExpr))
+	{
+		FromExpr   *f = (FromExpr *) jtnode;
+		ListCell   *l;
+
+		foreach(l, f->fromlist)
+			CreateIvmTriggersOnBaseTables(qry, lfirst(l), matviewOid, relids);
+	}
+	else if (IsA(jtnode, JoinExpr))
+	{
+		JoinExpr   *j = (JoinExpr *) jtnode;
+
+		CreateIvmTriggersOnBaseTables(qry, j->larg, matviewOid, relids);
+		CreateIvmTriggersOnBaseTables(qry, j->rarg, matviewOid, relids);
+	}
+	else
+		elog(ERROR, "unrecognized node type: %d", (int) nodeTag(jtnode));
 }
 
 /*
@@ -613,4 +760,275 @@ static void
 intorel_destroy(DestReceiver *self)
 {
 	pfree(self);
+}
+
+/*
+ * CreateIvmTrigger -- create IVM trigger on a base table
+ */
+static void
+CreateIvmTrigger(Oid relOid, Oid viewOid, int16 type, int16 timing)
+{
+	ObjectAddress	refaddr;
+	ObjectAddress	address;
+	CreateTrigStmt *ivm_trigger;
+	List *transitionRels = NIL;
+
+	Assert(timing == TRIGGER_TYPE_BEFORE || timing == TRIGGER_TYPE_AFTER);
+
+	refaddr.classId = RelationRelationId;
+	refaddr.objectId = viewOid;
+	refaddr.objectSubId = 0;
+
+	ivm_trigger = makeNode(CreateTrigStmt);
+	ivm_trigger->relation = NULL;
+	ivm_trigger->row = false;
+
+	ivm_trigger->timing = timing;
+	ivm_trigger->events = type;
+
+	switch (type)
+	{
+		case TRIGGER_TYPE_INSERT:
+			ivm_trigger->trigname = (timing == TRIGGER_TYPE_BEFORE ? "IVM_trigger_ins_before" : "IVM_trigger_ins_after");
+			break;
+		case TRIGGER_TYPE_DELETE:
+			ivm_trigger->trigname = (timing == TRIGGER_TYPE_BEFORE ? "IVM_trigger_del_before" : "IVM_trigger_del_after");
+			break;
+		case TRIGGER_TYPE_UPDATE:
+			ivm_trigger->trigname = (timing == TRIGGER_TYPE_BEFORE ? "IVM_trigger_upd_before" : "IVM_trigger_upd_after");
+			break;
+		default:
+			elog(ERROR, "unsupported trigger type");
+	}
+
+	if (timing == TRIGGER_TYPE_AFTER)
+	{
+		if (type == TRIGGER_TYPE_INSERT || type == TRIGGER_TYPE_UPDATE)
+		{
+			TriggerTransition *n = makeNode(TriggerTransition);
+			n->name = "ivm_newtable";
+			n->isNew = true;
+			n->isTable = true;
+
+			transitionRels = lappend(transitionRels, n);
+		}
+		if (type == TRIGGER_TYPE_DELETE || type == TRIGGER_TYPE_UPDATE)
+		{
+			TriggerTransition *n = makeNode(TriggerTransition);
+			n->name = "ivm_oldtable";
+			n->isNew = false;
+			n->isTable = true;
+
+			transitionRels = lappend(transitionRels, n);
+		}
+	}
+
+	ivm_trigger->funcname =
+		(timing == TRIGGER_TYPE_BEFORE ? SystemFuncName("IVM_immediate_before") : SystemFuncName("IVM_immediate_maintenance"));
+
+	ivm_trigger->columns = NIL;
+	ivm_trigger->transitionRels = transitionRels;
+	ivm_trigger->whenClause = NULL;
+	ivm_trigger->isconstraint = false;
+	ivm_trigger->deferrable = false;
+	ivm_trigger->initdeferred = false;
+	ivm_trigger->constrrel = NULL;
+	ivm_trigger->args = list_make1(makeString(
+		DatumGetPointer(DirectFunctionCall1(oidout, ObjectIdGetDatum(viewOid)))));
+
+	address = CreateTrigger(ivm_trigger, NULL, relOid, InvalidOid, InvalidOid,
+						 InvalidOid, InvalidOid, InvalidOid, NULL, true, false);
+
+	recordDependencyOn(&address, &refaddr, DEPENDENCY_IMMV);
+
+	/* Make changes-so-far visible */
+	CommandCounterIncrement();
+}
+
+
+/*
+ * check_ivm_restriction_walker --- look for specify nodes in the query tree
+ */
+static void
+check_ivm_restriction_walker(Node *node)
+{
+	if (node == NULL)
+		return;
+
+	switch (nodeTag(node))
+	{
+		case T_Query:
+			{
+				Query *qry = (Query *)node;
+				ListCell   *lc;
+				/* if contained CTE, return error */
+				if (qry->cteList != NIL)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("CTE is not supported on incrementally maintainable materialized view")));
+				if (qry->havingQual != NULL)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg(" HAVING clause is not supported on incrementally maintainable materialized view")));
+				if (qry->sortClause != NIL)	/* There is a possibility that we don't need to return an error */
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("ORDER BY clause is not supported on incrementally maintainable materialized view")));
+				if (qry->limitOffset != NULL || qry->limitCount != NULL)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("LIMIT/OFFSET clause is not supported on incrementally maintainable materialized view")));
+				if (qry->hasDistinctOn)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("DISTINCT ON is not supported on incrementally maintainable materialized view")));
+				if (qry->hasWindowFuncs)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("window functions are not supported on incrementally maintainable materialized view")));
+				if (qry->groupingSets != NIL)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("GROUPING SETS, ROLLUP, or CUBE clauses is not supported on incrementally maintainable materialized view")));
+				if (qry->setOperations != NULL)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("UNION/INTERSECT/EXCEPT statements are not supported on incrementally maintainable materialized view")));
+				if (list_length(qry->targetList) == 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("empty target list is not supported on incrementally maintainable materialized view")));
+				if (qry->rowMarks != NIL)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("FOR UPDATE/SHARE clause is not supported on incrementally maintainable materialized view")));
+
+				/* if contained VIEW or subquery into RTE, return error */
+				foreach(lc, qry->rtable)
+				{
+					RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+					if (rte->tablesample != NULL)
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("TABLESAMPLE clause is not supported on incrementally maintainable materialized view")));
+					if (rte->relkind == RELKIND_RELATION && find_inheritance_children(rte->relid, NoLock) != NIL)
+							ereport(ERROR,
+									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									 errmsg("inheritance parent is not supported on incrementally maintainable materialized view")));
+					if (rte->relkind == RELKIND_VIEW ||
+							rte->relkind == RELKIND_MATVIEW)
+							ereport(ERROR,
+									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									 errmsg("VIEW or MATERIALIZED VIEW is not supported on incrementally maintainable materialized view")));
+
+				}
+
+				/* search in jointree */
+				check_ivm_restriction_walker((Node *) qry->jointree);
+
+				/* search in target lists */
+				foreach(lc, qry->targetList)
+				{
+					TargetEntry *tle = (TargetEntry *) lfirst(lc);
+					if (isIvmColumn(tle->resname))
+							ereport(ERROR,
+									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									 errmsg("column name %s is not supported on incrementally maintainable materialized view", tle->resname)));
+					check_ivm_restriction_walker((Node *) tle->expr);
+				}
+
+				break;
+			}
+		case T_JoinExpr:
+			{
+				JoinExpr *joinexpr = (JoinExpr *)node;
+
+				/* left side */
+				check_ivm_restriction_walker((Node *) joinexpr->larg);
+				/* right side */
+				check_ivm_restriction_walker((Node *) joinexpr->rarg);
+				check_ivm_restriction_walker((Node *) joinexpr->quals);
+			}
+			break;
+		case T_FromExpr:
+			{
+				ListCell *lc;
+				FromExpr *fromexpr = (FromExpr *)node;
+				foreach(lc, fromexpr->fromlist)
+				{
+					check_ivm_restriction_walker((Node *) lfirst(lc));
+				}
+
+				check_ivm_restriction_walker((Node *) fromexpr->quals);
+			}
+			break;
+		case T_Var:
+			{
+				/* if system column, return error */
+				Var	*variable = (Var *) node;
+				if (variable->varattno < 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("system column is not supported on incrementally maintainable materialized view")));
+			}
+			break;
+		case T_BoolExpr:
+			{
+				BoolExpr   *boolexpr = (BoolExpr *) node;
+				ListCell   *lc;
+
+				foreach(lc, boolexpr->args)
+				{
+					Node	   *arg = (Node *) lfirst(lc);
+					check_ivm_restriction_walker(arg);
+				}
+				break;
+			}
+		case T_NullIfExpr: /* same as OpExpr */
+		case T_DistinctExpr: /* same as OpExpr */
+		case T_OpExpr:
+			{
+				OpExpr	   *op = (OpExpr *) node;
+				ListCell   *lc;
+				foreach(lc, op->args)
+				{
+					Node	   *arg = (Node *) lfirst(lc);
+					check_ivm_restriction_walker(arg);
+				}
+				break;
+			}
+		case T_CaseExpr:
+			{
+				CaseExpr *caseexpr = (CaseExpr *) node;
+				ListCell *lc;
+				/* result for ELSE clause */
+				check_ivm_restriction_walker((Node *) caseexpr->defresult);
+				/* expr for WHEN clauses */
+				foreach(lc, caseexpr->args)
+				{
+					CaseWhen *when = (CaseWhen *) lfirst(lc);
+					Node *w_expr = (Node *) when->expr;
+					/* result for WHEN clause */
+					check_ivm_restriction_walker((Node *) when->result);
+					/* expr clause*/
+					check_ivm_restriction_walker((Node *) w_expr);
+				}
+				break;
+			}
+		case T_SubLink:
+		case T_SubPlan:
+		case T_Aggref:
+		case T_GroupingFunc:
+		case T_WindowFunc:
+		case T_FuncExpr:
+		case T_SQLValueFunction:
+		case T_Const:
+		case T_Param:
+		default:
+			/* do nothing */
+			break;
+	}
+
+	return;
 }
