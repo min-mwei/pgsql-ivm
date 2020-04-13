@@ -83,8 +83,10 @@ typedef struct
 
 typedef struct
 {
+	bool	has_outerjoin;
 	bool	has_subquery;
 	bool	has_agg;
+	List	*join_quals;
 } check_ivm_restriction_context;
 
 /* utility functions for CTAS definition creation */
@@ -99,6 +101,7 @@ static void intorel_destroy(DestReceiver *self);
 
 static void CreateIvmTrigger(Oid relOid, Oid viewOid, int16 type, int16 timing);
 static void check_ivm_restriction_walker(Node *node, check_ivm_restriction_context *ctx, int depth);
+static bool is_equijoin_condition(OpExpr *op);
 static bool check_aggregate_supports_ivm(Oid aggfnoid);
 
 /*
@@ -325,7 +328,7 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 
 	if (is_matview && into->ivm)
 	{
-		check_ivm_restriction_context ctx = {false, false};
+		check_ivm_restriction_context ctx = {false, false, false, NIL};
 
 		if(contain_mutable_functions((Node *)query))
 			ereport(ERROR,
@@ -625,7 +628,6 @@ rewriteQueryForIMMV(Query *query, List *colNames)
 		rewritten->targetList = lappend(rewritten->targetList, tle);
 		rewritten->hasAggs = true;
 	}
-
 
 	return rewritten;
 }
@@ -1095,6 +1097,12 @@ check_ivm_restriction_walker(Node *node, check_ivm_restriction_context *ctx, int
 
 					if (rte->rtekind ==  RTE_SUBQUERY)
 					{
+						if (ctx->has_outerjoin)
+							ereport(ERROR,
+									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									 errmsg("this query is not allowed on incrementally maintainable materialized view"),
+									 errhint("subquery is not supported with outer join")));
+
 						ctx->has_subquery = true;
 						check_ivm_restriction_walker((Node *) rte->subquery, ctx, depth + 1);
 					}
@@ -1111,7 +1119,75 @@ check_ivm_restriction_walker(Node *node, check_ivm_restriction_context *ctx, int
 							ereport(ERROR,
 									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 									 errmsg("column name %s is not supported on incrementally maintainable materialized view", tle->resname)));
+					if (ctx->has_agg && !IsA(tle->expr, Aggref) && contain_aggs_of_level((Node *) tle->expr, 0))
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("expression containing an aggregate in it is not supported on incrementally maintainable materialized view")));
 					check_ivm_restriction_walker((Node *) tle->expr, ctx, depth);
+				}
+
+				/* additional restriction checks for outer join query */
+				if (ctx->has_outerjoin && depth == 0)
+				{
+					List	*where_quals_vars = NIL;
+					List	*nonnullable_vars = find_nonnullable_vars((Node *) qry->jointree->quals);
+					List	*qual_vars = NIL;
+					ListCell *lc;
+
+					foreach (lc, ctx->join_quals)
+					{
+						OpExpr	*op = (OpExpr *) lfirst(lc);
+
+						if (!is_equijoin_condition(op))
+								ereport(ERROR,
+										(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+										 errmsg("this query is not allowed on incrementally maintainable materialized view"),
+										 errhint("Only simple equijoin is supported with outer join")));
+
+						op = (OpExpr *) flatten_join_alias_vars(qry, (Node *) op);
+						qual_vars = list_concat(qual_vars, pull_vars_of_level((Node *) op, 0));
+					}
+
+					foreach (lc, qual_vars)
+					{
+						Var	*var = lfirst(lc);
+						ListCell *lc2;
+						bool found = false;
+
+						foreach(lc2, qry->targetList)
+						{
+							TargetEntry	*tle = lfirst(lc2);
+
+							if (IsA(tle->expr, Var))
+							{
+								Var *var2 = (Var *) flatten_join_alias_vars(qry, (Node *) tle->expr);
+								if (var->varno == var2->varno && var->varattno == var2->varattno)
+								{
+									found = true;
+									break;
+								}
+							}
+						}
+						if (!found)
+							ereport(ERROR,
+									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									 errmsg("this query is not allowed on incrementally maintainable materialized view"),
+									 errhint("targetlist must contain vars in the join condition with outer join")));
+					}
+
+					where_quals_vars = pull_vars_of_level(flatten_join_alias_vars(qry, (Node *) qry->jointree->quals), 0);
+
+					if (list_length(list_difference(where_quals_vars, nonnullable_vars)) > 0)
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("this query is not allowed on incrementally maintainable materialized view"),
+								 errhint("WHERE cannot contain non null-rejecting predicates with outer join")));
+
+					if (contain_nonstrict_functions((Node *) qry->targetList))
+							ereport(ERROR,
+									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+									 errmsg("this query is not allowed on incrementally maintainable materialized view"),
+									 errhint("targetlist cannot contain non strict functions with outer join")));
 				}
 
 				break;
@@ -1119,7 +1195,22 @@ check_ivm_restriction_walker(Node *node, check_ivm_restriction_context *ctx, int
 		case T_JoinExpr:
 			{
 				JoinExpr *joinexpr = (JoinExpr *)node;
+				if (IS_OUTER_JOIN(joinexpr->jointype))
+				{
+					if (ctx->has_subquery)
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("this query is not allowed on incrementally maintainable materialized view"),
+								 errhint("subquery is not supported with outer join")));
+					if (ctx->has_agg)
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("this query is not allowed on incrementally maintainable materialized view"),
+								 errhint("aggregate is not supported with outer join")));
 
+					ctx->has_outerjoin = true;
+					ctx->join_quals = lappend(ctx->join_quals, joinexpr->quals);
+				}
 				/* left side */
 				check_ivm_restriction_walker((Node *) joinexpr->larg, ctx, depth);
 				/* right side */
@@ -1205,6 +1296,11 @@ check_ivm_restriction_walker(Node *node, check_ivm_restriction_context *ctx, int
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("nested subquery is not supported on incrementally maintainable materialized view")));
+				if (ctx->has_outerjoin)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("this query is not allowed on incrementally maintainable materialized view"),
+							 errhint("subquery with outer join is not supported")));
 				check_ivm_restriction_walker(sublink->subselect, ctx, depth + 1);
 				break;
 			}
@@ -1248,6 +1344,43 @@ check_ivm_restriction_walker(Node *node, check_ivm_restriction_context *ctx, int
 	}
 
 	return;
+}
+
+/*
+ * is_equijoin_condition - check if all operators must be btree equality or hash equality
+ */
+static bool
+is_equijoin_condition(OpExpr *op)
+{
+	Oid			opno;
+	Node	   *left_expr;
+	Node	   *right_expr;
+	Relids		left_varnos;
+	Relids		right_varnos;
+	Oid			opinputtype;
+
+	/* Is it a binary opclause? */
+	if (!IsA(op, OpExpr) || list_length(op->args) != 2)
+		return false;
+
+	opno = op->opno;
+	left_expr = linitial(op->args);
+	right_expr = lsecond(op->args);
+	left_varnos = pull_varnos(left_expr);
+	right_varnos = pull_varnos(right_expr);
+	opinputtype = exprType(left_expr);
+
+	if (bms_num_members(left_varnos) != 1 || bms_num_members(right_varnos) != 1 ||
+		bms_equal(left_varnos, right_varnos) !=0)
+		return false;
+
+	if (op_mergejoinable(opno, opinputtype) && get_mergejoin_opfamilies(opno) != NIL)
+		return true;
+
+	if (op_hashjoinable(opno, opinputtype))
+		return true;
+
+	return false;
 }
 
 /*
